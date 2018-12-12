@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -21,7 +23,12 @@ func randomASCII(minlength int, maxlength int) string {
 		"abcdefghijklmnopqrstuvwxyz" +
 		"0123456789" +
 		"-+!<#$%>&()?*")
-	length := mathrand.Intn(maxlength-minlength) + minlength
+	var length int
+	if minlength == maxlength {
+		length = minlength
+	} else {
+		length = mathrand.Intn(maxlength-minlength) + minlength
+	}
 	var b strings.Builder
 	for i := 0; i < length; i++ {
 		num, _ := rand.Int(rand.Reader, big.NewInt(int64(len(chars))))
@@ -46,7 +53,8 @@ func initializeDB(db *sql.DB) {
 		user_id integer,
 		org_id integer,
 		key text,
-		salt text
+		salt text,
+		nonce text
 	  );`)
 	if createerr != nil {
 		panic(createerr.Error())
@@ -88,18 +96,39 @@ func addUser(db *sql.DB, name string, pass string, superuser bool) int {
 func addKeys(db *sql.DB, adminID int, adminPass string, orgID int) {
 	salt := make([]byte, 32)
 	io.ReadFull(rand.Reader, salt)
-	pubKey, privKey, _ := box.GenerateKey(rand.Reader)
 
-	_, err := db.Exec(`UPDATE Organizations SET pub_key="$1" WHERE id="$2"`, pubKey, orgID)
+	nonce := make([]byte, 12)
+	io.ReadFull(rand.Reader, nonce)
+	pubKey, privKey, _ := box.GenerateKey(rand.Reader)
+	block, _ := aes.NewCipher(argon2.IDKey([]byte(adminPass), salt, 1, 64*1024, 4, 32))
+	aesgcm, _ := cipher.NewGCM(block)
+	_, err := db.Exec(`UPDATE Organizations SET pub_key=$1 WHERE id=$2`, hex.EncodeToString(pubKey[:]), orgID)
 	if err != nil {
 		panic(err.Error())
 	}
 
-	_, err1 := db.Exec(`INSERT INTO Keys (user_id, org_id, key, salt) VALUES ($1, $2, $3, $4)"`, adminID, orgID, hex.EncodeToString(argon2.IDKey([]byte(adminPass), salt, 1, 64*1024, 4, 64)), hex.EncodeToString(salt))
+	_, err1 := db.Exec(`INSERT INTO Keys (user_id, org_id, key, salt, nonce) VALUES ($1, $2, $3, $4, $5)`, adminID, orgID, hex.EncodeToString(aesgcm.Seal(nil, nonce, privKey[:], nil)), hex.EncodeToString(salt), hex.EncodeToString(nonce))
 	if err1 != nil {
 		panic(err1.Error())
 	}
 
+	/*row := db.QueryRow(`SELECT key, salt, nonce FROM Keys WHERE user_id=$1`, adminID)
+	var key string
+	var salted string
+	var nonced string
+	row.Scan(&key, &salted, &nonced)
+	keyByte, _ := hex.DecodeString(key)
+	saltBytes, _ := hex.DecodeString(salted)
+	nonceBytes, _ := hex.DecodeString(nonced)
+
+	blocker, _ := aes.NewCipher(argon2.IDKey([]byte(adminPass), saltBytes, 1, 64*1024, 4, 32))
+
+	aesgcmer, _ := cipher.NewGCM(blocker)
+
+	plaintext, _ := aesgcmer.Open(nil, nonceBytes, keyByte, nil)
+
+	fmt.Println(hex.EncodeToString(plaintext))
+	fmt.Println(hex.EncodeToString(privKey[:])) Debugging code commented out */
 }
 
 func addOrganization(db *sql.DB, orgName string, adminName string, adminPass string) {
